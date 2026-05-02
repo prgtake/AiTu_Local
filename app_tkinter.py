@@ -884,11 +884,35 @@ class TutorApp(tk.Tk):
 
             threading.Thread(target=_task, daemon=True).start()
 
+        def _reorganize():
+            if not messagebox.askyesno("確認", "全ての画像要約データを基に、学習計画（章立て）をゼロから再構築します。\n既存の「未分類」などの分け方は破棄されますが、画像や問題は消えません。\n\n実行しますか？"):
+                return
+            
+            run_btn[0].configure(state="disabled")
+            reorg_btn.configure(state="disabled")
+
+            def _task():
+                try:
+                    from anki_importer import reorganize_syllabus_from_summaries
+                    res = reorganize_syllabus_from_summaries(subject=subj, progress_cb=_log)
+                    if res["success"]:
+                        self.after(0, lambda: messagebox.showinfo("完了", "シラバスの再構成が完了しました。メニューに戻ります。"))
+                        self.after(0, self._show_menu_screen)
+                    else:
+                        self.after(0, lambda m=res["message"]: messagebox.showerror("エラー", m))
+                except Exception as e:
+                    self.after(0, lambda err=e: _log(f"❌ システムエラー: {err}"))
+                finally:
+                    self.after(0, lambda: [run_btn[0].configure(state="normal"), reorg_btn.configure(state="normal")])
+            
+            threading.Thread(target=_task, daemon=True).start()
+
         btn_f = tk.Frame(f, bg=BG)
         btn_f.pack(pady=6)
-        btn = styled_btn(btn_f, "🚀 AI再分類を開始", _start, width=20)
-        btn.pack(side="left", padx=8)
-        run_btn[0] = btn
+        reorg_btn = styled_btn(btn_f, "🤖 AIで章立てから再構成する (おすすめ)", _reorganize, width=32, bg="#6a1b9a")
+        reorg_btn.pack(side="left", padx=8)
+        run_btn[0] = styled_btn(btn_f, "🔄 既存の章へAIで再分類", _start, width=22, bg="#00796b")
+        run_btn[0].pack(side="left", padx=8)
         styled_btn(btn_f, "← メニューへ戻る", self._show_menu_screen, width=16, bg="#888").pack(side="left", padx=8)
 
     def _import_folder_images(self):
@@ -1696,7 +1720,16 @@ class TutorApp(tk.Tk):
 
             for i, item in enumerate(answered):
                 q_fmt = item["q"].get("format", "記述式問題")
-                u_ans_text = item["user_answer"] if item["user_answer"] else "（テキスト回答なし。添付画像を確認して採点してください）"
+                u_ans_raw = item["user_answer"].strip() if item["user_answer"] else ""
+                has_img = bool(item["img_path"])
+
+                if not u_ans_raw and not has_img:
+                    u_ans_text = "（未回答）"
+                elif not u_ans_raw and has_img:
+                    u_ans_text = "（テキスト回答なし。添付画像を確認して採点してください）"
+                else:
+                    u_ans_text = u_ans_raw
+
                 contents.append(f"問{i+1}【出題形式：{q_fmt}】: {item['q']['question']}\n模範解答: {item['q']['answer']}\nユーザー回答（テキスト）: {u_ans_text}")
                 for img_path in item["img_path"]:
                     try: contents.extend([f"問{i+1} の手書き・添付ファイル：", *ai_engine.file_to_parts(img_path)])
@@ -2415,7 +2448,16 @@ class TutorApp(tk.Tk):
             for i, q in enumerate(self.test_questions):
                 ans = self.user_answers[i]
                 q_fmt = q.get("format", "記述式問題")
-                u_ans_text = ans['text'] if ans['text'] else "（テキスト回答なし。添付画像を確認して採点してください）"
+                u_ans_raw = ans['text'].strip() if ans['text'] else ""
+                has_img = bool(ans["img_path"])
+
+                if not u_ans_raw and not has_img:
+                    u_ans_text = "（未回答）"
+                elif not u_ans_raw and has_img:
+                    u_ans_text = "（テキスト回答なし。添付画像を確認して採点してください）"
+                else:
+                    u_ans_text = u_ans_raw
+
                 contents.append(f"問{i+1}【出題形式：{q_fmt}】: {q['question']}\n模範解答: {q['answer']}\nユーザー回答（テキスト）: {u_ans_text}")
                 for img_path in ans["img_path"]:
                     contents.extend([f"問{i+1} の手書き・添付ファイル：", *ai_engine.file_to_parts(img_path)])

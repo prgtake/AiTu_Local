@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# Data and Media (Local only)
+乙種第４類_media/
+乙種第４類.db
+*.db
+参考Cloud版/
+
+# Distribution / Backups
+*.zip
+*.bak
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# PyInstaller / EXE Build
+build/
+dist/
+*.spec

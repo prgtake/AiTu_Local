@@ -89,11 +89,14 @@ def _extract_apkg(apkg_path: str, work_dir: str) -> None:
 
 
 def _collect_media(work_dir: str, subject: str,
-                   progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, str]:
+                   progress_cb: Optional[Callable[[str], None]] = None,
+                   extra_info: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """
     Anki の media インデックス (JSON) を読み取り、
     数字ファイルを元ファイル名にリネームして <subject>_media/ へコピーする。
 
+    Args:
+        extra_info: { "元ファイル名": "AI解析時に追加する知識テキスト" }
     Returns:
         { "元ファイル名": "コピー先フルパス" } の辞書
     """
@@ -110,6 +113,7 @@ def _collect_media(work_dir: str, subject: str,
     dest_dir = get_media_dir(subject)
     result: Dict[str, str] = {}
     total = len(media_map)
+    extra_info = extra_info or {}
 
     for i, (num_key, orig_name) in enumerate(media_map.items(), 1):
         src = os.path.join(work_dir, num_key)
@@ -136,8 +140,15 @@ def _collect_media(work_dir: str, subject: str,
                 import time
                 if progress_cb:
                     progress_cb(f"🤖 画像をAIで解析中... {safe_name}")
+                
+                # 目隠し問題などの追加情報があれば取得
+                context = extra_info.get(safe_name, "")
+                
                 summary = ai_engine.analyze_image_for_summary(dst)
                 if summary:
+                    # 追加情報があれば統合する
+                    if context:
+                        summary = f"{summary}\n\n[補足知識]\n{context}"
                     database.save_media_summary(subject, safe_name, summary)
                 time.sleep(4)  # 無料APIのレート制限（15回/分）対策の待機時間
             except Exception as e:
@@ -164,6 +175,20 @@ _MEDIA_EXTS = (
 
 # Ankiのメディアファイル名パターン: MD5ハッシュ(32桁16進数)で始まる文字列
 _ANKI_MEDIA_HASH_RE = re.compile(r'^[0-9a-fA-F]{32}')
+
+
+def _is_image_occlusion(model_name: str) -> bool:
+    """ノートタイプ名から目隠し問題(Image Occlusion)かどうか判定する"""
+    name = model_name.lower()
+    return "image occlusion" in name or "画像目隠し" in name
+
+
+def _extract_image_filename(text: str) -> Optional[str]:
+    """HTMLテキストから最初の <img> タグの src ファイル名を取り出す"""
+    m = re.search(r'<img [^>]*src=["\']([^"\']+)["\']', text)
+    if m:
+        return os.path.basename(m.group(1))
+    return None
 
 
 def _looks_like_media_filename(text: str) -> bool:
@@ -253,15 +278,14 @@ def _parse_notes(anki2_path: str) -> List[Dict]:
         "flds":  [field0_text, field1_text, ...],   # HTMLタグ除去済み
         "flds_raw": [field0_html, ...],             # 生HTML
         "tags":  ["tag1", "tag2", ...],
-        "model": "モデル名 (ノートタイプ名)"
+        "model": "モデル名 (ノートタイプ名)",
+        "is_io": bool                               # Image Occlusion かどうか
     }
     """
     conn = sqlite3.connect(anki2_path)
     conn.row_factory = sqlite3.Row
 
     # ── ノートタイプ (models) を取得 ──
-    # Anki2 形式: col テーブルの models カラムに JSON で保存
-    # Anki21 形式: notetypes テーブルに移行済み（col.models が存在しない場合がある）
     models_json: Dict[str, Dict] = {}
     results = []
     try:
@@ -270,7 +294,7 @@ def _parse_notes(anki2_path: str) -> List[Dict]:
             if col_row and col_row["models"]:
                 models_json = json.loads(col_row["models"])
         except Exception:
-            pass  # Anki21など models カラムが無い場合はスキップ
+            pass
 
         notes_raw = conn.execute(
             "SELECT id, mid, flds, tags FROM notes"
@@ -280,6 +304,7 @@ def _parse_notes(anki2_path: str) -> List[Dict]:
             model_id   = str(row["mid"])
             model_def  = models_json.get(model_id, {})
             model_name = model_def.get("name", "")
+            is_io      = _is_image_occlusion(model_name)
 
             flds_raw  = row["flds"].split(_ANKI_FIELD_SEP)
             flds_text = [_strip_html(f) for f in flds_raw]
@@ -290,6 +315,7 @@ def _parse_notes(anki2_path: str) -> List[Dict]:
                 "flds_raw": flds_raw,
                 "tags":     tags,
                 "model":    model_name,
+                "is_io":    is_io,
             })
     finally:
         conn.close()
@@ -335,17 +361,15 @@ def generate_syllabus_from_tags(
     """
     タグ一覧（とオプションの問題冒頭サンプル）を Gemini に送り、
     学習計画 JSON を生成して返す。
-
-    トークン節約のため、全問題ではなくタグのみ送信する。
     """
-    import ai_engine  # ローカルインポートで循環参照を避ける
+    import ai_engine
 
     unique_tags = sorted(set(tags))
-    tag_block   = "\n".join(f"- {t}" for t in unique_tags[:500])  # 最大500タグ
+    tag_block   = "\n".join(f"- {t}" for t in unique_tags[:500])
 
     sample_block = ""
     if note_samples:
-        samples = note_samples[:30]  # 最大30サンプル
+        samples = note_samples[:30]
         sample_block = "\n\n【問題文サンプル（先頭30件）】\n" + "\n".join(
             f"{i+1}. {s[:80]}" for i, s in enumerate(samples)
         )
@@ -369,10 +393,7 @@ def generate_syllabus_from_tags(
 # =====================================================
 
 def _score_note_for_topic(note: Dict, topic: Dict) -> float:
-    """
-    ノートと章の「マッチスコア」を返す。
-    タグ一致 > キーワード一致 の優先度。
-    """
+    """ノートと章の「マッチスコア」を返す"""
     score = 0.0
     keywords  = [kw.lower() for kw in (topic.get("keywords") or [])]
     note_tags = [t.lower()  for t  in (note.get("tags")     or [])]
@@ -380,20 +401,15 @@ def _score_note_for_topic(note: Dict, topic: Dict) -> float:
 
     for kw in keywords:
         if kw in note_tags:
-            score += 3.0   # タグ一致は高得点
+            score += 3.0
         elif kw in note_text:
-            score += 1.0   # テキスト内一致
+            score += 1.0
 
     return score
 
 
 def assign_topic_ids(notes: List[Dict], plan: List[Dict]) -> List[Tuple[Dict, str]]:
-    """
-    各ノートを学習計画の章 (topic_id) に振り分ける。
-
-    Returns: [(note, topic_id), ...]
-    """
-    # フラットなトピックリストを作成（sub_topics も含む）
+    """各ノートを学習計画の章 (topic_id) に振り分ける"""
     flat_topics: List[Dict] = []
     for chapter in plan:
         subs = chapter.get("sub_topics", [])
@@ -433,7 +449,7 @@ def _register_plan(subject: str, plan: List[Dict]) -> None:
 
 
 def _has_content(s: str) -> bool:
-    """imgタグも「内容あり」と見なしてフィールドの有効性を判定する"""
+    """内容の有無を判定"""
     if not s:
         return False
     text_only = re.sub(r'<img[^>]*>', '', s).strip()
@@ -446,10 +462,7 @@ def _register_questions(
     assigned:    List[Tuple[Dict, str]],
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> int:
-    """
-    割り当て済みノートを database の question テーブルへ登録する。
-    Returns: 登録した問題数
-    """
+    """問題のDB登録"""
     import database as _db
     import datetime
 
@@ -464,21 +477,26 @@ def _register_questions(
     try:
         for i, (note, topic_id) in enumerate(assigned, 1):
             flds = note.get("flds", [])
-            if len(flds) < 2:
-                continue  # 表裏がそろっていない場合はスキップ
+            
+            # 目隠し問題(IO)の処理
+            if note.get("is_io"):
+                # IOカードの場合の暫定的な割り当て
+                question = flds[0].strip() if flds else ""
+                if "<img" not in question and len(flds) > 1:
+                    question = flds[1].strip() + "<br>" + question
+                
+                answer = flds[5].strip() if len(flds) > 5 else (flds[2].strip() if len(flds) > 2 else "画像を確認してください")
+                explanation = flds[6].strip() if len(flds) > 6 else ""
+            else:
+                if len(flds) < 2:
+                    continue
+                question    = flds[0].strip()
+                answer      = flds[1].strip()
+                explanation = flds[2].strip() if len(flds) > 2 else ""
 
-            # Anki の基本構造: フィールド0 = 表 (問題), フィールド1 = 裏 (解答)
-            question    = flds[0].strip()
-            answer      = flds[1].strip()
-            explanation = flds[2].strip() if len(flds) > 2 else ""
-
-            # スキップ判定:
-            # ・完全に空 → スキップ
-            # ・<img> タグのみでテキストなしのフィールドは有効（画像問題）なのでスキップしない
             if not _has_content(question) or not _has_content(answer):
                 continue
 
-            # media パスを修正
             question    = fix_media_paths(question, subject)
             answer      = fix_media_paths(answer, subject)
             explanation = fix_media_paths(explanation, subject)
@@ -509,10 +527,6 @@ class AnkiImporter:
     """
     .apkg ファイルを読み込み、シラバスを逆コンパイルして
     database.py に登録するまでの一連の処理を管理するクラス。
-
-    使い方:
-        importer = AnkiImporter(apkg_path, subject)
-        importer.run(progress_callback=lambda msg: print(msg))
     """
 
     def __init__(self, apkg_path: str, subject: str):
@@ -520,32 +534,64 @@ class AnkiImporter:
         self.subject   = subject
         self._work_dir: Optional[str] = None
 
-    # --------------------------------------------------
+    def _shard_plan(self, assigned: List[Tuple[Dict, str]], plan: List[Dict], max_per_topic: int = 20) -> Tuple[List[Tuple[Dict, str]], List[Dict]]:
+        """1つのトピックに問題が多すぎる場合、(1), (2) のように分割する（オート・シャィディング）。"""
+        topic_to_notes = {}
+        for note, tid in assigned:
+            if tid not in topic_to_notes: topic_to_notes[tid] = []
+            topic_to_notes[tid].append(note)
+
+        new_plan = []
+        new_assigned = []
+
+        for ch in plan:
+            subs = ch.get("sub_topics", [])
+            new_subs = []
+            
+            if subs:
+                for sub in subs:
+                    tid = sub["id"]
+                    notes = topic_to_notes.get(tid, [])
+                    if len(notes) > max_per_topic:
+                        for i in range(0, len(notes), max_per_topic):
+                            idx = (i // max_per_topic) + 1
+                            shard_id = f"{tid}_s{idx}"
+                            shard_name = f"{sub['name']} ({idx})"
+                            new_subs.append({"id": shard_id, "name": shard_name, "keywords": sub.get("keywords", [])})
+                            for n in notes[i:i+max_per_topic]:
+                                new_assigned.append((n, shard_id))
+                    else:
+                        new_subs.append(sub)
+                        for n in notes: new_assigned.append((n, tid))
+                ch["sub_topics"] = new_subs
+                new_plan.append(ch)
+            else:
+                tid = ch["id"]
+                notes = topic_to_notes.get(tid, [])
+                if len(notes) > max_per_topic:
+                    for i in range(0, len(notes), max_per_topic):
+                        idx = (i // max_per_topic) + 1
+                        shard_id = f"{tid}_s{idx}"
+                        shard_name = f"{ch['name']} ({idx})"
+                        new_subs.append({"id": shard_id, "name": shard_name, "keywords": ch.get("keywords", [])})
+                        for n in notes[i:i+max_per_topic]:
+                            new_assigned.append((n, shard_id))
+                    ch["sub_topics"] = new_subs
+                    new_plan.append(ch)
+                else:
+                    new_plan.append(ch)
+                    for n in notes: new_assigned.append((n, tid))
+        
+        return new_assigned, new_plan
+
     def run(
         self,
         progress_cb:        Optional[Callable[[str], None]] = None,
         use_ai_syllabus:    bool = True,
-        batch_ai_classify:  bool = False,   # 将来: AI分類をバッチで行う拡張用フラグ
+        batch_ai_classify:  bool = False,
     ) -> Dict:
-        """
-        インポート処理全体を実行する。
-
-        Args:
-            progress_cb:       進捗メッセージを受け取るコールバック
-            use_ai_syllabus:   True = Gemini でシラバス生成、
-                               False = タグをそのまま章に使う簡易モード
-        Returns:
-            {
-              "success":     bool,
-              "message":     str,
-              "plan":        list,   # 生成された学習計画
-              "note_count":  int,    # 登録問題数
-              "media_count": int,    # コピーしたメディアファイル数
-            }
-        """
         def _cb(msg: str):
-            if progress_cb:
-                progress_cb(msg)
+            if progress_cb: progress_cb(msg)
 
         try:
             # ── Step 1: 解凍 ──────────────────────────────
@@ -553,41 +599,51 @@ class AnkiImporter:
             self._work_dir = tempfile.mkdtemp(prefix="anki_import_")
             _extract_apkg(self.apkg_path, self._work_dir)
 
-            # ── Step 2: メディア抽出 ──────────────────────
-            _cb("🖼️  メディアファイルを抽出中...")
-            media_result = _collect_media(self._work_dir, self.subject, _cb)
-            media_count  = len(media_result)
-            _cb(f"✅ メディア {media_count} 件を抽出しました。")
-
-            # ── Step 3: ノート解析 ────────────────────────
+            # ── Step 2: ノート解析 ────────────────────────
             _cb("🔍 ノートデータを解析中...")
             anki2_path = self._find_anki2()
             notes      = _parse_notes(anki2_path)
             _cb(f"✅ {len(notes)} 件のノートを検出しました。")
 
             if not notes:
-                return {
-                    "success": False,
-                    "message": "ノートが見つかりませんでした。",
-                    "plan": [], "note_count": 0, "media_count": media_count,
-                }
+                return {"success": False, "message": "ノートが見つかりませんでした。", "plan": [], "note_count": 0, "media_count": 0}
+
+            # 目隠し問題(IO)の「答え」を画像の追加知識として収集
+            extra_media_info = {}
+            for note in notes:
+                if note.get("is_io"):
+                    bg_img = _extract_image_filename(note["flds_raw"][4]) if len(note["flds_raw"]) > 4 else None
+                    if not bg_img:
+                        for fraw in note["flds_raw"]:
+                            bg_img = _extract_image_filename(fraw)
+                            if bg_img: break
+                    
+                    if bg_img:
+                        ans = note["flds"][5] if len(note["flds"]) > 5 else (note["flds"][2] if len(note["flds"]) > 2 else "")
+                        if ans:
+                            if bg_img not in extra_media_info: extra_media_info[bg_img] = []
+                            extra_media_info[bg_img].append(f"目隠し部分の正解: {ans}")
+
+            extra_media_info = {k: " / ".join(v) for k, v in extra_media_info.items()}
+
+            # ── Step 3: メディア抽出 ──────────────────────
+            _cb("🖼️  メディアファイルを抽出中...")
+            media_result = _collect_media(self._work_dir, self.subject, _cb, extra_info=extra_media_info)
+            media_count  = len(media_result)
+            _cb(f"✅ メディア {media_count} 件を抽出しました。")
 
             # ── Step 4: シラバス生成 ──────────────────────
             _cb("🧠 シラバスを生成中...")
-            all_tags     = [t for note in notes for t in note["tags"]]
+            all_tags = [t for note in notes for t in note["tags"]]
             note_samples = [note["flds"][0][:100] for note in notes if note["flds"]]
 
             if use_ai_syllabus and all_tags:
                 try:
-                    plan = generate_syllabus_from_tags(
-                        all_tags, self.subject, note_samples
-                    )
-                    _cb(f"✅ {len(plan)} 章のシラバスを生成しました。")
+                    plan = generate_syllabus_from_tags(all_tags, self.subject, note_samples)
                 except Exception as e:
-                    _cb(f"⚠️  AI シラバス生成失敗 ({e})。タグから簡易シラバスを作成します。")
+                    _cb(f"⚠️  AI シラバス生成失敗 ({e})。簡易シラバスを作成します。")
                     plan = self._make_simple_plan_from_tags(all_tags)
             else:
-                _cb("📋 タグから簡易シラバスを構築中...")
                 plan = self._make_simple_plan_from_tags(all_tags)
 
             if not plan:
@@ -597,23 +653,21 @@ class AnkiImporter:
             _cb("📂 問題を章に振り分け中...")
             assigned = assign_topic_ids(notes, plan)
 
-            # ── Step 6: DB への登録 ───────────────────────
+            # ── Step 6: オート・シャィディング (20枚分割) ──
+            _cb("✂️  大きな分野を小分けに分割中...")
+            assigned, plan = self._shard_plan(assigned, plan, max_per_topic=20)
+
+            # ── Step 7: DB への登録 ───────────────────────
             _cb("💾 学習計画をデータベースに登録中...")
             _register_plan(self.subject, plan)
 
-            # ▼▼▼ 問題のDB登録をスキップするように変更 ▼▼▼
-            # _cb("💾 問題をデータベースに登録中...")
-            # registered = _register_questions(
-            #     self.subject, assigned, _cb
-            # )
-            registered = 0  # 登録数を0に固定
-            _cb("✅ 問題のDB登録は行いません。")
-            # ▲▲▲ ここまで ▲▲▲
+            _cb("💾 問題をデータベースに登録中...")
+            registered = _register_questions(self.subject, assigned, _cb)
 
-            _cb(f"🎉 インポート完了！ 学習計画と {media_count} 件のメディアを登録しました。")
+            _cb(f"🎉 インポート完了！ {len(plan)} 章の学習計画と {registered} 問、{media_count} 件のメディアを登録しました。")
             return {
                 "success":    True,
-                "message":    f"学習計画と {media_count} 件のメディアを登録しました。（問題の登録はスキップしました）",
+                "message":    f"{len(plan)} 章の学習計画と {registered} 問、{media_count} 件のメディアを登録しました。",
                 "plan":       plan,
                 "note_count": registered,
                 "media_count": media_count,
@@ -622,67 +676,132 @@ class AnkiImporter:
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
-            return {
-                "success":    False,
-                "message":    f"エラーが発生しました: {e}\n{tb}",
-                "plan":       [],
-                "note_count": 0,
-                "media_count": 0,
-            }
+            return {"success": False, "message": f"エラー: {e}\n{tb}", "plan": [], "note_count": 0, "media_count": 0}
         finally:
             self._cleanup()
 
-    # --------------------------------------------------
     def _find_anki2(self) -> str:
-        """解凍ディレクトリから collection.anki2 を探す"""
-        # Anki21 形式 (collection.anki21) にも対応
         for name in ("collection.anki21", "collection.anki2"):
             path = os.path.join(self._work_dir, name)
             if os.path.exists(path):
                 return path
-        raise FileNotFoundError(
-            "collection.anki2 / collection.anki21 が見つかりません。"
-            "正しい .apkg ファイルか確認してください。"
-        )
+        raise FileNotFoundError("collection.anki2 が見つかりません。")
 
-    # --------------------------------------------------
     @staticmethod
     def _make_simple_plan_from_tags(all_tags: List[str]) -> List[Dict]:
-        """
-        AI を使わない簡易シラバス生成。
-        ユニークなタグをそのまま章として使う。
-        タグが多すぎる場合は頻度上位 30 件に絞る。
-        """
         from collections import Counter
         tag_counts = Counter(all_tags)
         top_tags   = [tag for tag, _ in tag_counts.most_common(30)]
-
         if not top_tags:
-            return [{"id": "anki_uncategorized", "name": "未分類",
-                     "keywords": [], "sub_topics": []}]
-
+            return [{"id": "anki_uncategorized", "name": "未分類", "keywords": [], "sub_topics": []}]
         plan = []
         for i, tag in enumerate(top_tags, 1):
             safe_id = re.sub(r"[^a-zA-Z0-9_]", "_", tag)
-            plan.append({
-                "id":        f"tag_{safe_id}_{i}",
-                "name":      tag,
-                "keywords":  [tag],
-                "sub_topics": [],
-            })
+            plan.append({"id": f"tag_{safe_id}_{i}", "name": tag, "keywords": [tag], "sub_topics": []})
         return plan
 
-    # --------------------------------------------------
     def _cleanup(self):
-        """一時ディレクトリを削除する"""
         if self._work_dir and os.path.exists(self._work_dir):
             shutil.rmtree(self._work_dir, ignore_errors=True)
             self._work_dir = None
 
 
-# =====================================================
-#  バッチ AI 分類 (トークン制限対策: 時間差送信)
-# =====================================================
+def reorganize_syllabus_from_summaries(
+    subject:     str,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict:
+    """
+    保存済みの全メディア要約をAIに渡し、最適なシラバスを再構築し、
+    全ての問題を新しい章に振り分け直す。
+    """
+    import database as _db
+    import ai_engine
+    import time
+    import sqlite3
+
+    def _cb(msg: str):
+        if progress_cb: progress_cb(msg)
+
+    _cb("📋 全メディア要約を取得中...")
+    summaries = _db.get_all_media_summaries(subject)
+    if not summaries:
+        return {"success": False, "message": "画像要約データが見つかりません。解析が終わるまでお待ちください。"}
+
+    _cb(f"🧠 {len(summaries)} 件の要約を基にシラバスを再構成中...")
+    
+    # 要約リストをテキスト化
+    summary_list_str = "\n".join(f"- {fname}: {text[:150]}" for fname, text in summaries.items())
+    
+    prompt = f"""あなたは教育専門家です。
+以下の画像要約リスト（Ankiデッキから抽出されたもの）を分析し、これらを学習するのに最適な体系的な学習計画（シラバス）を再構築してください。
+
+【画像要約リスト】
+{summary_list_str}
+
+【出力形式】
+JSONのみ。以下の構造で5〜10章程度にまとめてください。
+[
+  {{
+    "id": "ch_1",
+    "name": "章のタイトル",
+    "keywords": ["この章に含めるべき画像のファイル名", "キーワード", ...],
+    "sub_topics": []
+  }},
+  ...
+]
+
+【ルール】
+- 各章の `keywords` には、その章に分類されるべき「画像ファイル名」を可能な限り含めてください。
+- すべての画像がいずれかの章に収まるようにしてください。
+- 脈略がない場合は、内容が近いもの同士をグループ化してください。
+"""
+
+    try:
+        raw = ai_engine.gemini_once_json(prompt)
+        new_plan = json.loads(raw)
+        if not isinstance(new_plan, list): raise ValueError("AIからの回答がリスト形式ではありません。")
+
+        _cb("📂 新しい章に問題を振り分け中...")
+        
+        # questionテーブルから全問題を取得
+        conn = sqlite3.connect(_db.db_path(subject))
+        rows = conn.execute("SELECT id, question, answer FROM question").fetchall()
+        conn.close()
+
+        notes = []
+        for r in rows:
+            notes.append({
+                "id": r[0],
+                "flds": [r[1], r[2]],
+                "tags": []
+            })
+
+        # 振り分け
+        assigned = assign_topic_ids(notes, new_plan)
+        
+        # オート・シャィディング (20枚分割)
+        # AnkiImporterのインスタンスを作って実行
+        importer = AnkiImporter(None, subject)
+        final_assigned, final_plan = importer._shard_plan(assigned, new_plan, max_per_topic=20)
+
+        # DB更新
+        _db.save_cfg(subject, {"plan": final_plan})
+        
+        conn = sqlite3.connect(_db.db_path(subject))
+        try:
+            for note, tid in final_assigned:
+                conn.execute("UPDATE question SET topic_id=? WHERE id=?", (tid, note["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+        _cb("✅ シラバスの再構成と問題の再配置が完了しました。")
+        return {"success": True, "message": "シラバスを再構成しました。", "plan": final_plan}
+
+    except Exception as e:
+        _cb(f"❌ エラー: {e}")
+        return {"success": False, "message": str(e)}
+
 
 def batch_classify_with_ai(
     subject:     str,
@@ -691,79 +810,51 @@ def batch_classify_with_ai(
     delay_sec:   float = 2.0,
     progress_cb: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """
-    既存 question テーブルの topic_id を AI で再分類する。
-    トークン制限に配慮し、batch_size 件ずつ処理する。
-
-    ※ 通常インポートでは使用しない。
-    　 UI から「AI再分類」ボタンを押した際に呼び出す想定。
-    """
     import time
     import database as _db
     import ai_engine
 
     def _cb(msg: str):
-        if progress_cb:
-            progress_cb(msg)
+        if progress_cb: progress_cb(msg)
 
     conn = sqlite3.connect(_db.db_path(subject))
     try:
-        rows = conn.execute(
-            "SELECT id, question FROM question ORDER BY id"
-        ).fetchall()
+        rows = conn.execute("SELECT id, question FROM question ORDER BY id").fetchall()
     finally:
         conn.close()
 
     total   = len(rows)
     updated = 0
-
-    # フラットなトピックリストを作る
     flat_topics = []
     for ch in plan:
         for sub in ch.get("sub_topics", []) or [ch]:
             flat_topics.append({"id": sub["id"], "name": sub["name"]})
 
-    topic_list_str = "\n".join(
-        f"- id: {t['id']}  名前: {t['name']}" for t in flat_topics
-    )
+    topic_list_str = "\n".join(f"- id: {t['id']}  名前: {t['name']}" for t in flat_topics)
 
     for batch_start in range(0, total, batch_size):
         batch = rows[batch_start: batch_start + batch_size]
-        qs_str = "\n".join(
-            f"[id={r[0]}] {r[1][:120]}" for r in batch
-        )
-
-        prompt = (
-            f"以下の問題リストを、与えられたトピックリストのいずれかに分類してください。\n\n"
-            f"【トピックリスト】\n{topic_list_str}\n\n"
-            f"【問題リスト】\n{qs_str}\n\n"
-            f"【出力形式】JSONのみ。例: "
-            f'[{{"id": 1, "topic_id": "chapter_1_1"}}, ...]\n'
-            f"各問題の id と最も適切な topic_id を出力してください。"
-        )
+        qs_str = "\n".join(f"[id={r[0]}] {r[1][:120]}" for r in batch)
+        prompt = (f"以下の問題リストを、与えられたトピックリストのいずれかに分類してください。\n\n"
+                  f"【トピックリスト】\n{topic_list_str}\n\n"
+                  f"【問題リスト】\n{qs_str}\n\n"
+                  f"【出力形式】JSONのみ。例: [{{\"id\": 1, \"topic_id\": \"chapter_1_1\"}}, ...]")
 
         try:
-            raw     = ai_engine.gemini_once_json(prompt)
+            raw = ai_engine.gemini_once_json(prompt)
             results = json.loads(raw)
-
             conn = sqlite3.connect(_db.db_path(subject))
             try:
                 for item in results:
-                    conn.execute(
-                        "UPDATE question SET topic_id=? WHERE id=?",
-                        (item["topic_id"], item["id"]),
-                    )
+                    conn.execute("UPDATE question SET topic_id=? WHERE id=?", (item["topic_id"], item["id"]))
                     updated += 1
                 conn.commit()
             finally:
                 conn.close()
-
             _cb(f"AI 再分類中... ({min(batch_start + batch_size, total)}/{total})")
-
         except Exception as e:
             _cb(f"⚠️  バッチ {batch_start}〜{batch_start+batch_size} でエラー: {e}")
-
         if batch_start + batch_size < total:
-            time.sleep(delay_sec)   # レート制限を避けるため少し待機
+            time.sleep(delay_sec)
 
     _cb(f"✅ AI 再分類完了。{updated} 件を更新しました。")
