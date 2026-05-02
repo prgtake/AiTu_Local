@@ -75,7 +75,7 @@ def get_full_media_block(subject: str, query: str = None) -> str:
 # =====================================================
 
 # アプリのバージョンを定義（バグ報告・サポート時にタイトルバーで確認できる）
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 
 # 実行環境(OS)を判定して最適なフォントファミリを設定
 if sys.platform.startswith("win"):
