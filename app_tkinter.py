@@ -75,7 +75,7 @@ def get_full_media_block(subject: str, query: str = None) -> str:
 # =====================================================
 
 # アプリのバージョンを定義（バグ報告・サポート時にタイトルバーで確認できる）
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # 実行環境(OS)を判定して最適なフォントファミリを設定
 if sys.platform.startswith("win"):
@@ -1397,6 +1397,12 @@ class TutorApp(tk.Tk):
         tk.Entry(num_frame, textvariable=num_var, font=FONT_NORMAL, width=6, justify="center", relief="solid").pack(side="left", padx=8)
         tk.Label(num_frame, text="問", font=FONT_NORMAL, bg=BG).pack(side="left")
 
+        tk.Label(num_frame, text="　　一括出題形式：", font=FONT_BOLD, bg=BG).pack(side="left")
+        format_options = ["分野別の設定に従う", "正誤問題", "5肢択一問題", "穴埋め問題", "記述式問題", "論証問題", "理系用計算問題（途中式あり）", "理系用証明・導出問題"]
+        gen_format_var = tk.StringVar(value=format_options[0])
+        gen_format_combo = ttk.Combobox(num_frame, textvariable=gen_format_var, values=format_options, font=FONT_NORMAL, width=25, state="readonly")
+        gen_format_combo.pack(side="left", padx=8)
+
         sel_frame = tk.Frame(f, bg=BG)
         sel_frame.pack(side="bottom", fill="x", pady=(16, 4))
         tk.Label(sel_frame, text="AnkiDecを出力する範囲を選択（複数選択可）：", font=FONT_BOLD, bg=BG).pack(anchor="w")
@@ -1441,6 +1447,8 @@ class TutorApp(tk.Tk):
             )
             if not filepath: return
 
+            override_format = gen_format_var.get()
+
             def task():
                 results = []
                 total = len(target_tids)
@@ -1454,7 +1462,11 @@ class TutorApp(tk.Tk):
                     # トピックごとに最適な画像ブロックを取得
                     media_block = get_full_media_block(subj, query=tname)
 
-                    q_format = self.cfg_data.get("topic_settings", {}).get(tid, "記述式問題")
+                    if override_format == "分野別の設定に従う":
+                        q_format = self.cfg_data.get("topic_settings", {}).get(tid, "記述式問題")
+                    else:
+                        q_format = override_format
+
                     prompt_modifiers = ""
                     ans_hint = "模範解答"
                     if q_format == "正誤問題": prompt_modifiers += "\n【出題形式：正誤問題】問題文は必ず「〇」か「×」で答えられる文章にし、問題文の冒頭に必ず「次の記述の正誤を答えてください。」という一文を入れてください。"; ans_hint = "〇 または ×"
