@@ -21,6 +21,9 @@ import datetime
 import time
 import json
 import os
+import sys
+import tkinter as tk
+import tkinter.simpledialog as sd
 import shutil
 import re
 import base64
@@ -69,32 +72,28 @@ def apply_custom_styles():
 
 # --- 0. 共通プロンプト・ヘルパー ---
 def get_full_media_block(subject: str, query: str = None) -> str:
-    """メディア要約をプロンプト用に整形（クエリ指定時はベクトル検索で上位10件を抽出）"""
-    if query:
-        # ベクトルデータを含む全メディア情報を取得
-        all_media = database.get_all_media_with_embeddings(subject)
-        if not all_media:
-            return "\n\n【画像出力の禁止】\n現在利用可能な画像データはありません。架空の画像ファイル名を作成して `<img src=\"...\">` のようなタグを出力することは絶対にやめてください。\n"
-        
-        # クエリに基づいて関連性の高い上位10件を抽出
+    """
+    画像要約とベクトルデータを利用し、クエリに関連する上位10件の画像情報をプロンプト用に構築する。
+    """
+    all_media = database.get_all_media_with_embeddings(subject)
+    if not all_media:
+        return "\n【画像出力の禁止】現在利用可能な画像データはありません。架空の画像ファイル名を作成して `<img src=\"...\">` のようなタグを出力することは絶対にやめてください。\n"
+    
+    # クエリがある場合はベクトル検索で上位10件を抽出、なければ全件から先頭10件
+    if (query and query.strip()):
         relevant_media = ai_engine.find_top_relevant_images(query, all_media, top_n=10)
-        
-        block = "\n\n【利用可能な画像データ（最優先ルール：関連上位10件のみ）】\n"
-        block += "【重要】解説内で図を示す際は、必ず以下のリストにある正確なファイル名を用いて `<img src=\"ファイル名\">` の形式を使用してください。リストにない架空のファイル名は絶対に使用しないでください。\n"
-        for m in relevant_media:
-            block += f"- {m['filename']}: {m['summary']}\n"
-        return block
     else:
-        # 互換性のため、クエリがない場合は従来通り全件取得（件数が少ない場合用）
-        summaries = database.get_all_media_summaries(subject)
-        if not summaries:
-            return "\n\n【画像出力の禁止】\n現在利用可能な画像データはありません。架空の画像ファイル名を作成して `<img src=\"...\">` のようなタグを出力することは絶対にやめてください。\n"
-        
-        block = "\n\n【利用可能な画像データ（解析済み）】\n"
-        block += "【重要】解説内で図を示す際は、必ず以下のリストにある正確なファイル名を用いて `<img src=\"ファイル名\">` の形式を使用してください。リストにない架空의ファイル名は絶対に使用しないでください。\n"
-        for fname, summary in summaries.items():
-            block += f"- {fname}: {summary}\n"
-        return block
+        relevant_media = all_media[:10]
+    
+    block = "\n\n【利用可能な画像データ（最優先ルール：関連上位10件のみ）】\n"
+    block += "【重要】画像を表示する場合は、必ず以下のリストにある正確なファイル名を用いて `<img src=\"ファイル名\">` の形式で出力してください。リストにない架空のファイル名は絶対に生成・使用しないでください。\n"
+    for m in relevant_media:
+        block += f"- {m['filename']}: {m['summary']}\n"
+    
+    block += "\n【図表出力の優先ルール】\n"
+    block += "説明、問題、回答、または解説に図解が必要な場合、まずは提供された画像データの中に適切なものがあれば `<img src=\"ファイル名\">` を優先して使用してください。\n"
+    block += "該当する画像がない場合に限り、Plotlyを用いたPythonコードを作成して図表を自作してください（matplotlib不可）。\n"
+    return block
 
 def safe_json_parse(raw_text):
     """AIの出力を安全にパースし、エラー時はデフォルト構造を返す"""
@@ -221,8 +220,60 @@ if "cfg_data" not in st.session_state: st.session_state.cfg_data = None
 if "pending_plan" not in st.session_state: st.session_state.pending_plan = None
 
 
-# APIキー設定（環境変数またはSecretsから）
-api_key = os.environ.get("GEMINI_API_KEY")
+# APIキー設定（環境変数、設定ファイル、またはダイアログから）
+def get_api_key_blocking():
+    """
+    APIキーを確認し、不足していればOSダイアログを表示して入力を促す。
+    設定された場合は app_config.json に保存し、os.environ にもセットする。
+    """
+    # 1. 環境変数を確認
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if api_key and api_key != "YOUR_API_KEY_HERE":
+        return api_key
+
+    # 2. app_config.json を確認 (Tkinter版と同じ場所を探す)
+    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    CONFIG_FILE = os.path.join(base_dir, "app_config.json")
+    
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved_key = json.load(f).get("GEMINI_API_KEY")
+                if saved_key and saved_key != "YOUR_API_KEY_HERE":
+                    os.environ["GEMINI_API_KEY"] = saved_key # キャッシュとして環境変数にセット
+                    return saved_key
+        except Exception: pass
+
+    # 3. ダイアログを表示 (PCローカル実行時のみ機能)
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.eval('tk::PlaceWindow . center')
+        
+        key = sd.askstring("API キー", "Gemini API キーを入力してください：\n（次回から入力不要になります）", parent=root)
+        root.destroy()
+        
+        if key:
+            os.environ["GEMINI_API_KEY"] = key # キャッシュとしてセット
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"GEMINI_API_KEY": key}, f)
+            except Exception as e:
+                print(f"キーの保存に失敗しました: {e}")
+            return key
+        else:
+            # 入力されなかった場合はサーバーアプリを終了
+            print("APIキーが入力されませんでした。終了します。")
+            os._exit(0) 
+            
+    except Exception as e:
+        # Tkinterが動作しない環境（ヘッドレスサーバーなど）の場合
+        st.error(f"APIキーが設定されていません。環境変数 GEMINI_API_KEY を設定してください。 エラー: {e}")
+        st.stop()
+    return None
+
+api_key = get_api_key_blocking()
 if api_key: ai_engine.set_api_key(api_key)
 
 def navigate_to(page_name):
@@ -314,6 +365,60 @@ def show_confirm_plan_screen():
         st.session_state.current_subject = plan['subject']
         navigate_to("menu")
     if st.button("← 戻る"): navigate_to("new_subject")
+
+def show_anki_reclassify_screen():
+    """🔄 AIで問題を再分類画面"""
+    subj = st.session_state.current_subject
+    cfg = st.session_state.cfg_data
+    plan = cfg.get("plan", [])
+    
+    st.title(f"🔄 AIで問題を再分類 : {subj}")
+    st.info("キーワードマッチングより精度の高いAI分類で全問題を再振り分けします。")
+    
+    batch_size = st.number_input("1回あたりの処理件数", min_value=1, max_value=100, value=20)
+    st.caption("※ 多いほど速いですが API の負荷が上がります。")
+
+    log_area = st.empty()
+    log_text = []
+    
+    def progress_cb(msg):
+        log_text.append(msg)
+        log_area.code("\n".join(log_text[-10:]), language="text")
+
+    st.subheader("🤖 学習計画の再構成")
+    st.write("全ての画像要約データを基に、学習計画（章立て）をゼロから再構築します。")
+    confirm_reorg = st.checkbox("既存の分類が破棄されることを理解し、再構成を実行する")
+    
+    if st.button("🚀 AIで章立てから再構成する", width="stretch", disabled=not confirm_reorg):
+        with st.spinner("シラバスを再構成中..."):
+            try:
+                from anki_importer import reorganize_syllabus_from_summaries
+                res = reorganize_syllabus_from_summaries(subj, progress_cb=progress_cb)
+                if res["success"]:
+                    st.success("完了しました！メニューに戻ります。")
+                    time.sleep(2)
+                    navigate_to("menu")
+                else:
+                    st.error(res["message"])
+            except Exception as e:
+                show_friendly_error(e)
+
+    st.divider()
+    st.subheader("🔄 既存の章への再分類")
+    st.write("現在の章立てを維持したまま、未分類の問題をAIで適切な章に振り分けます。")
+    if st.button("🔄 AI再分類を実行", width="stretch"):
+        with st.spinner("再分類を実行中..."):
+            try:
+                from anki_importer import batch_classify_with_ai
+                batch_classify_with_ai(subject=subj, plan=plan, batch_size=batch_size, delay_sec=2.0, progress_cb=progress_cb)
+                st.success("AIによる再分類が完了しました。")
+            except Exception as e:
+                show_friendly_error(e)
+
+    st.divider()
+    if st.button("← 学習メニューへ戻る", width="stretch"):
+        navigate_to("menu")
+
 
 def show_menu_screen():
     """4. 学習メニュー画面 [手順4] - 機能維持+色分け+オートフォーカス+KeyError修正版"""
@@ -433,7 +538,7 @@ def show_menu_screen():
         st.rerun()
 
     # --- ボタン群 ---
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
     if col1.button("▶ 学習開始", width="stretch"):
         # セレクトボックスで選ばれている分野オブジェクトを取得
         st.session_state.current_topic = next(o for o in topic_options if o["display"] == sel_disp)
@@ -450,9 +555,16 @@ def show_menu_screen():
         navigate_to("free_chat")
     if col5.button("🃏 AnkiDec出力"):
         navigate_to("anki_export")
-    if col6.button("🖼️ 図解一括取込"):
+    
+    if cfg.get("anki_imported"):
+        if col6.button("🔄 AIで再分類"):
+            navigate_to("anki_reclassify")
+    else:
+        col6.empty()
+        
+    if col7.button("🖼️ 図解一括取込"):
         navigate_to("image_batch_import")
-    if col7.button("🏠 ホームへ"): 
+    if col8.button("🏠 ホームへ"): 
         navigate_to("start")
 
 def show_image_batch_import_screen():
@@ -878,6 +990,7 @@ def show_lesson_screen():
                             show_friendly_error(e)
             
             if script_data and isinstance(script_data, list):
+                playlist = []
                 for i, line in enumerate(script_data):
                     text = line.get("text", "").strip()
                     if not text: continue
@@ -894,10 +1007,75 @@ def show_lesson_screen():
                             except Exception as e:
                                 st.error(f"音声の生成に失敗しました: {e}")
                     
-                    with st.container():
-                        st.markdown(f"**{'👨‍🏫' if '先生' in speaker else '👩‍🎓'} {speaker}**: {text}")
-                        if os.path.exists(mp3_path):
-                            st.audio(mp3_path, format="audio/mp3")
+                    # テキスト表示
+                    st.markdown(f"**{'👨‍🏫' if '先生' in speaker else '👩‍🎓'} {speaker}**: {text}")
+                    
+                    # プレイリストに追加（Base64化）
+                    if os.path.exists(mp3_path):
+                        try:
+                            with open(mp3_path, "rb") as f:
+                                b64 = base64.b64encode(f.read()).decode()
+                                playlist.append({
+                                    "speaker": speaker,
+                                    "text": text,
+                                    "b64": f"data:audio/mp3;base64,{b64}"
+                                })
+                        except: pass
+
+                if playlist:
+                    st.write("---")
+                    player_html = f"""
+                    <div style="background: #f8f9fb; padding: 15px; border-radius: 12px; border: 1px solid #dee2e6; margin: 10px 0; font-family: sans-serif;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;">
+                            <span style="font-weight: bold; color: #1e90ff;">🎙️ ポッドキャスト連続再生</span>
+                            <span id="audio-info" style="font-size: 0.8rem; color: #6c757d;">準備完了</span>
+                        </div>
+                        <audio id="main-player" controls style="width: 100%; height: 45px;"></audio>
+                        <div id="now-playing" style="font-size: 0.85rem; margin-top: 10px; color: #495057; border-left: 3px solid #1e90ff; padding-left: 8px; min-height: 1.2em; line-height: 1.4;"></div>
+                        <div style="margin-top: 12px; display: flex; gap: 8px;">
+                            <button onclick="playPrev()" style="flex: 1; padding: 6px; cursor: pointer; border: 1px solid #ccc; border-radius: 6px; background: #fff; font-size: 0.8rem;">⏮ 前へ</button>
+                            <button onclick="playNext()" style="flex: 1; padding: 6px; cursor: pointer; border: 1px solid #ccc; border-radius: 6px; background: #fff; font-size: 0.8rem;">次へ ⏭</button>
+                        </div>
+                    </div>
+
+                    <script>
+                    const playlist = {json.dumps(playlist)};
+                    const player = document.getElementById('main-player');
+                    const info = document.getElementById('audio-info');
+                    const nowPlaying = document.getElementById('now-playing');
+                    let currentIdx = 0;
+
+                    function loadTrack(idx) {{
+                        if (idx < 0 || idx >= playlist.length) return;
+                        currentIdx = idx;
+                        player.src = playlist[idx].b64;
+                        const icon = playlist[idx].speaker.includes("先生") ? "👨‍🏫" : "👩‍🎓";
+                        nowPlaying.innerText = icon + " " + playlist[idx].speaker + ": " + playlist[idx].text;
+                        info.innerText = "再生中: " + (idx + 1) + " / " + playlist.length;
+                    }}
+
+                    function playNext() {{
+                        if (currentIdx + 1 < playlist.length) {{
+                            loadTrack(currentIdx + 1);
+                            player.play();
+                        }} else {{
+                            info.innerText = "再生完了";
+                            nowPlaying.innerText = "✨ 最後まで聴き終わりました！";
+                        }}
+                    }}
+                    
+                    function playPrev() {{
+                        if (currentIdx - 1 >= 0) {{
+                            loadTrack(currentIdx - 1);
+                            player.play();
+                        }}
+                    }}
+
+                    player.onended = playNext;
+                    loadTrack(0);
+                    </script>
+                    """
+                    st.components.v1.html(player_html, height=185)
                             
             if st.button("❌ 音声解説を閉じる", width="stretch"):
                 st.session_state.generate_audio = False
@@ -1875,7 +2053,6 @@ def show_anki_export_screen():
                 results = []
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                media_block = get_full_media_block(subj)
                 
                 try:
                     for i, topic in enumerate(selected_topics):
@@ -1883,24 +2060,33 @@ def show_anki_export_screen():
                         
                         # そのトピックに関連する画像だけを10枚抽出
                         media_block = get_full_media_block(subj, topic["name"])
-
                         lesson_text = database.load_explane(subj, topic["id"]) or ""
                         lesson_scope = (f"\n\n【出題範囲の限定】必ず以下の「説明本文」の内容のみから作成してください。\n--- 説明本文 ---\n{re.sub(r'```python\\s*\\n([\\s\\S]*?)```', '【図表省略】', lesson_text)}\n--- ここまで ---" if lesson_text else "")
                         
                         q_format = cfg.get("topic_settings", {}).get(topic["id"], "記述式問題")
+                        prompt_modifiers = ""
+                        ans_hint = "模範解答"
+                        if q_format == "正誤問題":
+                            prompt_modifiers += "\n【出題形式：正誤問題】問題文は必ず「〇」か「×」で答えられる文章にし、問題文の冒頭に必ず「次の記述の正誤を答えてください。」という一文を入れてください。"
+                            ans_hint = "〇 または ×"
+                        elif q_format == "5肢択一問題":
+                            prompt_modifiers += "\n【出題形式：5肢択一問題】問題文の最後に必ず「1. 〜 2. 〜 3. 〜 4. 〜 5. 〜」という形式で5つの選択肢を提示してください。"
+                            ans_hint = "選択肢の番号（1〜5）"
+                        elif q_format == "穴埋め問題":
+                            prompt_modifiers += "\n【出題形式：穴埋め問題】問題文の重要なキーワードを（　）で空欄にし、そこに入る語句を答えさせる形式にしてください。1つの問題につき空欄は1〜2箇所としてください。"
                         
                         prompt = f"""科目「{subj}」の「{topic['name']}」について、Anki用の問題と解答を {num_per_topic}問 作成してください。
+{prompt_modifiers}
 
 【重複・バラエティに関する絶対ルール】
 1. 今回作成する {num_per_topic}問 の中で、問う内容や概念が重複しないように細心の注意を払ってください。
 2. 各問題は、分野内の異なる側面（定義、計算、理由、例外、応用など）を網羅するようにバラエティ豊かに構成してください。
-3. 似たような正解になる問題が2つ以上含まれることは「質の低いカードセット」とみなされます。
 
 【図表・メディア活用のスマート・ルール】
 1. あなたには、この科目のために用意された画像リスト（下記）が提供されています。
 2. **問題文(`question`)での画像活用：**
    - 画像の中に答え（用語や数値など）が直接書かれている場合は、その画像を問題文に使用してはいけません。
-   - 「この図が示す現象は何か？」「図中のAは何を指しているか？」といった、画像の内容を分析・解釈させる問題の場合は、積極的に画像を使用して出題してください。その際は必ずリストにある正確なファイル名を用いて `<img src="ファイル名">` を使用してください。
+   - 「この図が示す現象は何か？」「図中のAは何を指しているか？」といった、画像の内容を分析・解釈させる問題の場合は、積極的に画像を使用して出題してください。
 3. **解答(`answer`)や解説(`explanation`)での画像活用：**
    - 理解を助けるために、解答や解説の中では積極的に図解としての画像を挿入してください。
 4. **【厳禁】** [※図1] や (画像:...) のようなテキスト形式での引用はシステムが読み取れないため「絶対に禁止」です。必ず `<img src="ファイル名">` 形式を使用してください。
@@ -1910,15 +2096,29 @@ def show_anki_export_screen():
 {lesson_scope}
 
 【出力形式】以下のJSON構造のみを出力（他テキスト不要）：
-[ {{"question": "問題文", "answer": "模範解答", "explanation": "詳しい解説"}} ]"""
+[ {{"question": "問題文", "answer": "{ans_hint}", "explanation": "詳しい解説"}} ]"""
 
-                        raw = ai_engine.gemini_once_json(prompt, use_web_search=cfg.get("use_web_search"))
-                        new_qs = json.loads(ai_engine._extract_json(raw))
-                        results.extend(new_qs)
-                        
+                        # APIリトライと待機時間の実装
+                        max_retries = 3
+                        success_gen = False
+                        for attempt in range(max_retries):
+                            try:
+                                raw = ai_engine.gemini_once_json(prompt, use_web_search=cfg.get("use_web_search"))
+                                new_qs = json.loads(ai_engine._extract_json(raw))
+                                if isinstance(new_qs, list):
+                                    results.extend(new_qs)
+                                    success_gen = True
+                                    # 大量生成時は API 制限にかかりやすいため、長めに待機
+                                    time.sleep(20)
+                                    break
+                            except Exception as e:
+                                if attempt < max_retries - 1:
+                                    status_text.text(f"⚠️ リトライ中 ({attempt+1}/{max_retries}): {topic['name']}")
+                                    time.sleep(30)
+                                else:
+                                    st.error(f"❌ {topic['name']} の生成に失敗しました: {e}")
+
                         progress_bar.progress((i + 1) / len(selected_topics))
-                        # API制限回避のための微小待機
-                        time.sleep(1)
 
                     if results:
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".apkg") as tmp:
